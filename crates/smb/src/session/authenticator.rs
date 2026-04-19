@@ -1,23 +1,22 @@
 use std::sync::Arc;
 
 use crate::Error;
-use crate::connection::AuthMethodsConfig;
 use crate::connection::connection_info::ConnectionInfo;
 use maybe_async::*;
 use sspi::{
-    AcquireCredentialsHandleResult, AuthIdentity, BufferType, ClientRequestFlags, CredentialUse,
-    DataRepresentation, InitializeSecurityContextResult, Negotiate, SecurityBuffer, Sspi,
-    ntlm::NtlmConfig,
+    AcquireCredentialsHandleResult, AuthIdentity, AuthIdentityBuffers, BufferType,
+    ClientRequestFlags, CredentialUse, DataRepresentation, InitializeSecurityContextResult, Ntlm,
+    SecurityBuffer, Sspi,
 };
-use sspi::{CredentialsBuffers, NegotiateConfig, SspiImpl, Username};
+use sspi::{SspiImpl, Username};
 
 #[derive(Debug)]
 pub struct Authenticator {
     server_hostname: String,
     user_name: Username,
 
-    ssp: Negotiate,
-    cred_handle: AcquireCredentialsHandleResult<Option<CredentialsBuffers>>,
+    ssp: Ntlm,
+    cred_handle: AcquireCredentialsHandleResult<Option<AuthIdentityBuffers>>,
     current_state: Option<InitializeSecurityContextResult>,
 }
 
@@ -26,28 +25,18 @@ impl Authenticator {
         identity: AuthIdentity,
         conn_info: &Arc<ConnectionInfo>,
     ) -> crate::Result<Authenticator> {
-        let client_computer_name = conn_info
-            .config
-            .client_name
-            .as_ref()
-            .unwrap_or(&String::from("smb-rs"))
-            .clone();
-        let mut negotiate_ssp = Negotiate::new_client(NegotiateConfig::new(
-            Box::new(NtlmConfig::default()),
-            Some(Self::get_available_ssp_pkgs(&conn_info.config.auth_methods)),
-            client_computer_name,
-        ))?;
+        let mut ntlm = Ntlm::new();
         let user_name = identity.username.clone();
 
-        let cred_handle = negotiate_ssp
+        let cred_handle = ntlm
             .acquire_credentials_handle()
             .with_credential_use(CredentialUse::Outbound)
-            .with_auth_data(&sspi::Credentials::AuthIdentity(identity.clone()))
-            .execute(&mut negotiate_ssp)?;
+            .with_auth_data(&identity)
+            .execute(&mut ntlm)?;
 
         Ok(Authenticator {
             server_hostname: conn_info.server_name.clone(),
-            ssp: negotiate_ssp,
+            ssp: ntlm,
             cred_handle,
             current_state: None,
             user_name,
@@ -73,7 +62,7 @@ impl Authenticator {
     }
 
     fn make_sspi_target_name(server_fqdn: &str) -> String {
-        format!("cifs/{server_fqdn}")
+        server_fqdn.to_string()
     }
 
     fn get_context_requirements() -> ClientRequestFlags {
@@ -110,9 +99,7 @@ impl Authenticator {
             .with_target_data_representation(Self::SSPI_REQ_DATA_REPRESENTATION)
             .with_output(&mut output_buffer);
 
-        if cfg!(feature = "kerberos") {
-            builder = builder.with_target_name(&target_name)
-        }
+        builder = builder.with_target_name(&target_name);
 
         let mut input_buffers = vec![];
         input_buffers.push(SecurityBuffer::new(gss_token.to_owned(), BufferType::Token));
@@ -179,15 +166,5 @@ impl Authenticator {
                 }
             }
         }
-    }
-
-    fn get_available_ssp_pkgs(config: &AuthMethodsConfig) -> String {
-        let krb_pku2u_config = if cfg!(feature = "kerberos") && config.kerberos {
-            "kerberos,!pku2u"
-        } else {
-            "!kerberos,!pku2u"
-        };
-        let ntlm_config = if config.ntlm { "ntlm" } else { "!ntlm" };
-        format!("{ntlm_config},{krb_pku2u_config}")
     }
 }
